@@ -1,6 +1,6 @@
 {
   "users": {
-    "tps_1000000001": {
+    "tsp_1000000001": {
       "username": "example_user",
       "fullname": "Example User",
       "role": "member",

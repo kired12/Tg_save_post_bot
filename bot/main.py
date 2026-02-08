@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import io
 import logging
 import os
@@ -47,7 +48,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
 )
 logger = logging.getLogger(__name__)
-driver_logger = logging.getLogger("tps.driver")
+driver_logger = logging.getLogger("tsp.driver")
 
 router_main = Router()
 _driver_manager = DriverManager(settings.driver)
@@ -61,8 +62,41 @@ _temp_profile_dirs: list[str] = []
 _CHROMEDRIVER_LOG_PATH = Path("chromedriver.log")
 _CHROMEDRIVER_LOG_MAX_BYTES = max(int(os.getenv("CHROMEDRIVER_LOG_MAX_BYTES", "10485760")), 1)
 _CHROMEDRIVER_LOG_KEEP_LINES = max(int(os.getenv("CHROMEDRIVER_LOG_KEEP_LINES", "5000")), 1)
+_USER_RATE_LIMIT_SECONDS = max(float(os.getenv("USER_RATE_LIMIT_SECONDS", "5")), 0.0)
+_CAPTURE_QUEUE_LIMIT = max(int(os.getenv("CAPTURE_QUEUE_LIMIT", "5")), 1)
+_CAPTURE_QUEUE_WAIT_SECONDS = max(float(os.getenv("CAPTURE_QUEUE_WAIT_SECONDS", "2")), 0.1)
+_capture_queue_slots = asyncio.BoundedSemaphore(_CAPTURE_QUEUE_LIMIT)
+_rate_limit_lock = asyncio.Lock()
+_last_user_request_ts: dict[int, float] = {}
 _first_image_notice_lock = asyncio.Lock()
 _is_first_image_after_start = True
+
+
+def _safe_html(value: object) -> str:
+    return html.escape(str(value), quote=False)
+
+
+async def _rate_limit_retry_after(user_id: int) -> float:
+    if _USER_RATE_LIMIT_SECONDS <= 0:
+        return 0.0
+
+    now = time.monotonic()
+    async with _rate_limit_lock:
+        last_seen = _last_user_request_ts.get(user_id)
+        if last_seen is not None:
+            retry_after = _USER_RATE_LIMIT_SECONDS - (now - last_seen)
+            if retry_after > 0:
+                return retry_after
+        _last_user_request_ts[user_id] = now
+        return 0.0
+
+
+async def _acquire_capture_slot() -> bool:
+    try:
+        await asyncio.wait_for(_capture_queue_slots.acquire(), timeout=_CAPTURE_QUEUE_WAIT_SECONDS)
+        return True
+    except asyncio.TimeoutError:
+        return False
 
 
 async def _consume_first_image_flag() -> bool:
@@ -76,14 +110,14 @@ async def _consume_first_image_flag() -> bool:
 
 def _mark_driver(driver: webdriver.Chrome, profile_dir: str | None) -> None:
     if profile_dir:
-        setattr(driver, "_tps_profile_dir", profile_dir)
+        setattr(driver, "_tsp_profile_dir", profile_dir)
         _temp_profile_dirs.append(profile_dir)
 
 
 def _cleanup_profile_from_driver(driver: webdriver.Chrome | None) -> None:
     if not driver:
         return
-    profile_dir = getattr(driver, "_tps_profile_dir", None)
+    profile_dir = getattr(driver, "_tsp_profile_dir", None)
     if profile_dir:
         try:
             shutil.rmtree(profile_dir, ignore_errors=True)
@@ -120,7 +154,7 @@ def _build_chrome_options(resolution: DriverResolution) -> tuple[Options, str | 
 
     # У Linux headless часто стабильнее с отдельным профилем.
     if is_linux:
-        temp_profile_dir = tempfile.mkdtemp(prefix="tps-chrome-profile-")
+        temp_profile_dir = tempfile.mkdtemp(prefix="tsp-chrome-profile-")
         chrome_options.add_argument(f"--user-data-dir={temp_profile_dir}")
         chrome_options.add_argument(f"--data-path={temp_profile_dir}")
         chrome_options.add_argument("--remote-debugging-port=0")
@@ -518,10 +552,11 @@ def _format_users_page() -> tuple[str, InlineKeyboardMarkup]:
         lines.append("Пока нет пользователей.")
     else:
         for key, data in users:
-            username = data.get("username", "None")
-            fullname = data.get("fullname", "*")
-            last_seen = data.get("last_seen", "*")
-            lines.append(f"• <code>{key}</code> @{username} ({fullname})\n  last_seen: {last_seen}")
+            username = _safe_html(data.get("username", "None"))
+            fullname = _safe_html(data.get("fullname", "*"))
+            last_seen = _safe_html(data.get("last_seen", "*"))
+            key_safe = _safe_html(key)
+            lines.append(f"• <code>{key_safe}</code> @{username} ({fullname})\n  last_seen: {last_seen}")
             keyboard_rows.append([InlineKeyboardButton(text=f"Открыть {key}", callback_data=f"admin:user:{key}")])
 
     keyboard_rows.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="admin:refresh")])
@@ -538,13 +573,16 @@ def _format_events_page(*, status: str | None = None) -> str:
         return "\n".join(lines)
 
     for event in events:
+        username = _safe_html(event.get("username", "None"))
+        action = _safe_html(event.get("action", "?"))
+        status_name = _safe_html(event.get("status", "?"))
         lines.append(
             "• {timestamp} | uid={user_id} | @{username} | {action} | {status}".format(
-                timestamp=event.get("timestamp", "?"),
-                user_id=event.get("user_id", "?"),
-                username=event.get("username", "None"),
-                action=event.get("action", "?"),
-                status=event.get("status", "?"),
+                timestamp=_safe_html(event.get("timestamp", "?")),
+                user_id=_safe_html(event.get("user_id", "?")),
+                username=username,
+                action=action,
+                status=status_name,
             )
         )
     return "\n".join(lines)
@@ -614,14 +652,19 @@ async def admin_find_user(message: types.Message) -> None:
         return
 
     key, user = found
+    username = _safe_html(user.get("username", "None"))
+    fullname = _safe_html(user.get("fullname", "*"))
+    role = _safe_html(user.get("role", "member"))
+    first_login = _safe_html(user.get("first_login", "*"))
+    last_seen = _safe_html(user.get("last_seen", "*"))
     await message.answer(
         "<b>Пользователь найден</b>\n"
-        f"key: <code>{key}</code>\n"
-        f"username: @{user.get('username', 'None')}\n"
-        f"fullname: {user.get('fullname', '*')}\n"
-        f"role: {user.get('role', 'member')}\n"
-        f"first_login: {user.get('first_login', '*')}\n"
-        f"last_seen: {user.get('last_seen', '*')}",
+        f"key: <code>{_safe_html(key)}</code>\n"
+        f"username: @{username}\n"
+        f"fullname: {fullname}\n"
+        f"role: {role}\n"
+        f"first_login: {first_login}\n"
+        f"last_seen: {last_seen}",
         parse_mode="HTML",
     )
 
@@ -677,18 +720,21 @@ async def admin_callbacks(callback: types.CallbackQuery) -> None:
     elif section == "user" and len(action) == 3:
         user_key = action[2]
         found = db_find_user(user_key)
-        if not found and user_key.startswith("tps_"):
-            found = db_find_user(user_key.replace("tps_", ""))
         if found:
             key, user = found
+            username = _safe_html(user.get("username", "None"))
+            fullname = _safe_html(user.get("fullname", "*"))
+            role = _safe_html(user.get("role", "member"))
+            first_login = _safe_html(user.get("first_login", "*"))
+            last_seen = _safe_html(user.get("last_seen", "*"))
             await callback.message.edit_text(
                 "<b>Карточка пользователя</b>\n"
-                f"key: <code>{key}</code>\n"
-                f"username: @{user.get('username', 'None')}\n"
-                f"fullname: {user.get('fullname', '*')}\n"
-                f"role: {user.get('role', 'member')}\n"
-                f"first_login: {user.get('first_login', '*')}\n"
-                f"last_seen: {user.get('last_seen', '*')}",
+                f"key: <code>{_safe_html(key)}</code>\n"
+                f"username: @{username}\n"
+                f"fullname: {fullname}\n"
+                f"role: {role}\n"
+                f"first_login: {first_login}\n"
+                f"last_seen: {last_seen}",
                 parse_mode="HTML",
                 reply_markup=_admin_menu(),
             )
@@ -751,35 +797,65 @@ async def handle_post_link(message: types.Message) -> None:
         )
         return
 
-    is_first_image = await _consume_first_image_flag()
-    if is_first_image:
-        await message.answer(
-            "⚠️ Внимание: это первое изображение после запуска бота.\n"
-            "Иногда оно может отобразиться некорректно.\n"
-            "Если результат будет неправильным, отправьте ту же ссылку ещё раз — обычно всё работает нормально."
-        )
-
-    progress_message = await message.answer("🔄 Обрабатываю пост...")
-    result = await capture_telegram_post(url, progress_message, cid)
-
-    if result:
-        filename, data = result
-        await progress_message.edit_text("📤 Отправляю скриншот...")
-        await message.answer_document(BufferedInputFile(data, filename=filename))
-        await progress_message.edit_text("✅ Скриншот успешно отправлен!")
+    retry_after = await _rate_limit_retry_after(user_id)
+    if retry_after > 0:
         db_log_event(
             user_id=user_id,
             username=username,
-            action="capture_success",
-            status="ok",
-            meta={"url": url},
-        )
-    else:
-        await progress_message.edit_text("❌ Не удалось обработать пост. Попробуйте еще раз!")
-        db_log_event(
-            user_id=user_id,
-            username=username,
-            action="capture_failed",
+            action="capture_rate_limited",
             status="error",
-            meta={"url": url},
+            meta={"retry_after": round(retry_after, 2)},
         )
+        await message.answer(f"⏳ Слишком часто. Повторите через {retry_after:.1f} сек.")
+        return
+
+    queue_slot_acquired = await _acquire_capture_slot()
+    if not queue_slot_acquired:
+        db_log_event(
+            user_id=user_id,
+            username=username,
+            action="capture_queue_overload",
+            status="error",
+            meta={
+                "queue_limit": _CAPTURE_QUEUE_LIMIT,
+                "queue_wait_seconds": _CAPTURE_QUEUE_WAIT_SECONDS,
+            },
+        )
+        await message.answer("⚠️ Бот сейчас перегружен. Попробуйте через 5-10 секунд.")
+        return
+
+    is_first_image = await _consume_first_image_flag()
+    try:
+        if is_first_image:
+            await message.answer(
+                "⚠️ Внимание: это первое изображение после запуска бота.\n"
+                "Иногда оно может отобразиться некорректно.\n"
+                "Если результат будет неправильным, отправьте ту же ссылку ещё раз — обычно всё работает нормально."
+            )
+
+        progress_message = await message.answer("🔄 Обрабатываю пост...")
+        result = await capture_telegram_post(url, progress_message, cid)
+
+        if result:
+            filename, data = result
+            await progress_message.edit_text("📤 Отправляю скриншот...")
+            await message.answer_document(BufferedInputFile(data, filename=filename))
+            await progress_message.edit_text("✅ Скриншот успешно отправлен!")
+            db_log_event(
+                user_id=user_id,
+                username=username,
+                action="capture_success",
+                status="ok",
+                meta={"url": url},
+            )
+        else:
+            await progress_message.edit_text("❌ Не удалось обработать пост. Попробуйте еще раз!")
+            db_log_event(
+                user_id=user_id,
+                username=username,
+                action="capture_failed",
+                status="error",
+                meta={"url": url},
+            )
+    finally:
+        _capture_queue_slots.release()

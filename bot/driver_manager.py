@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import platform
@@ -19,7 +20,7 @@ from urllib.request import urlopen
 from config import DriverSettings
 
 
-logger = logging.getLogger("tps.driver")
+logger = logging.getLogger("tsp.driver")
 
 _CFT_MILESTONES_URL = (
     "https://googlechromelabs.github.io/chrome-for-testing/"
@@ -235,11 +236,15 @@ class DriverManager:
         download_url = selected.get("url")
         if not isinstance(download_url, str) or not download_url.startswith("https://storage.googleapis.com/chrome-for-testing-public/"):
             raise DriverInstallError("Обнаружен небезопасный URL для скачивания драйвера.")
+        archive_sha256 = self._extract_sha256(selected)
+        if not archive_sha256:
+            raise DriverInstallError("В метаданных отсутствует sha256 для архива chromedriver.")
 
-        with tempfile.TemporaryDirectory(prefix="tps-driver-") as tmp_dir_name:
+        with tempfile.TemporaryDirectory(prefix="tsp-driver-") as tmp_dir_name:
             tmp_dir = Path(tmp_dir_name)
             archive_path = tmp_dir / "chromedriver.zip"
             self._download_with_retries(download_url, archive_path)
+            self._verify_sha256_or_raise(archive_path, archive_sha256)
 
             with zipfile.ZipFile(archive_path, "r") as archive:
                 archive.extractall(tmp_dir)
@@ -260,6 +265,7 @@ class DriverManager:
             browser_major=browser_major,
             source_url=download_url,
             platform_name=target.cft_platform,
+            archive_sha256=archive_sha256,
         )
 
     @staticmethod
@@ -282,6 +288,31 @@ class DriverManager:
         raise DriverInstallError(f"Не удалось скачать драйвер после {retries} попыток: {last_error}")
 
     @staticmethod
+    def _extract_sha256(download_item: dict[str, Any]) -> str | None:
+        for key in ("sha256", "sha_256", "checksum"):
+            value = download_item.get(key)
+            if isinstance(value, str) and re.fullmatch(r"[a-fA-F0-9]{64}", value):
+                return value.lower()
+        return None
+
+    @staticmethod
+    def _sha256_file(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def _verify_sha256_or_raise(self, path: Path, expected_sha256: str) -> None:
+        actual_sha256 = self._sha256_file(path)
+        expected = expected_sha256.lower()
+        if actual_sha256 != expected:
+            raise DriverInstallError(
+                "Контрольная сумма архива chromedriver не совпала: "
+                f"expected={expected} actual={actual_sha256}"
+            )
+
+    @staticmethod
     def _fetch_json(url: str) -> dict[str, Any]:
         try:
             with urlopen(url, timeout=20) as response:
@@ -289,7 +320,15 @@ class DriverManager:
         except Exception as exc:
             raise DriverInstallError(f"Не удалось получить метаданные Chrome for Testing: {exc}") from exc
 
-    def _write_metadata(self, *, destination: Path, browser_major: int, source_url: str, platform_name: str) -> None:
+    def _write_metadata(
+        self,
+        *,
+        destination: Path,
+        browser_major: int,
+        source_url: str,
+        platform_name: str,
+        archive_sha256: str,
+    ) -> None:
         metadata_path = self.chromedriver_dir / "metadata.json"
         metadata: dict[str, Any]
         if metadata_path.exists():
@@ -305,6 +344,7 @@ class DriverManager:
             "path": str(destination),
             "browser_major": browser_major,
             "download_url": source_url,
+            "archive_sha256": archive_sha256,
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
 

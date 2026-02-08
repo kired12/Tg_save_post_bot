@@ -22,7 +22,7 @@
 3. Переименуйте `.env.example` в `.env` и заполните `BOT_TOKEN`.
 4. Запустите:
    ```bash
-   python bot_tps.py
+   python bot_tsp.py
    ```
 
 
@@ -37,6 +37,9 @@
 - `CHROMEDRIVER_DIR` (default `chromedriver/`)
 - `CHROME_BINARY` (optional override пути к браузеру)
 - `CHROMEDRIVER_PATH` (debug override, не для обычного использования)
+- `USER_RATE_LIMIT_SECONDS` (default `5`, пауза между запросами одного пользователя)
+- `CAPTURE_QUEUE_LIMIT` (default `5`, лимит одновременных задач в очереди)
+- `CAPTURE_QUEUE_WAIT_SECONDS` (default `2`, сколько ждать места в очереди)
 
 ## Как работает автоустановка ChromeDriver
 
