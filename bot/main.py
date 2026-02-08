@@ -28,17 +28,20 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
 from bot.driver_manager import BrowserNotFoundError, DriverManager, DriverResolution
+from bot.i18n import default_locale, normalize_locale, supported_locales, translate
 from config import get_runtime_settings
 from database.database import (
     db_change,
     db_compact_events,
     db_find_user,
+    db_get_locale,
     db_get_value,
     db_log_event,
     db_recent_events,
     db_recent_users,
     db_register,
-    db_size_warning,
+    db_set_locale,
+    db_size_warning_mb,
     db_stats,
 )
 
@@ -70,6 +73,23 @@ _rate_limit_lock = asyncio.Lock()
 _last_user_request_ts: dict[int, float] = {}
 _first_image_notice_lock = asyncio.Lock()
 _is_first_image_after_start = True
+
+
+def _resolve_locale(user: types.User | None) -> str:
+    if not user:
+        return default_locale()
+
+    stored_locale = db_get_locale(user.id)
+    if stored_locale:
+        return normalize_locale(stored_locale)
+
+    auto_locale = normalize_locale(user.language_code)
+    db_set_locale(user.id, auto_locale)
+    return auto_locale
+
+
+def _t(locale: str, key: str, **kwargs: object) -> str:
+    return translate(locale, key, **kwargs)
 
 
 def _safe_html(value: object) -> str:
@@ -152,7 +172,7 @@ def _build_chrome_options(resolution: DriverResolution) -> tuple[Options, str | 
     if is_linux:
         chrome_options.add_argument("--disable-setuid-sandbox")
 
-    # У Linux headless часто стабильнее с отдельным профилем.
+    # Linux headless is usually more stable with an isolated profile.
     if is_linux:
         temp_profile_dir = tempfile.mkdtemp(prefix="tsp-chrome-profile-")
         chrome_options.add_argument(f"--user-data-dir={temp_profile_dir}")
@@ -178,7 +198,7 @@ def _trim_chromedriver_log_if_needed() -> None:
             fh.writelines(tail)
             fh.truncate()
     except Exception as exc:
-        logger.warning("Не удалось обрезать chromedriver.log: %s", exc)
+        logger.warning("Failed to trim chromedriver.log: %s", exc)
 
 
 def _create_driver_sync(resolution: DriverResolution) -> webdriver.Chrome:
@@ -286,7 +306,7 @@ def _selenium_capture(driver: webdriver.Chrome, url: str) -> bytes:
             break
 
     if post_element is None:
-        raise last_exc or TimeoutException("Не удалось найти элемент поста на странице")
+        raise last_exc or TimeoutException("Failed to find a post element on the page")
 
     if active_frame is not None:
         try:
@@ -405,10 +425,10 @@ async def preflight_driver_startup() -> None:
         )
     except BrowserNotFoundError as exc:
         _driver_error_hint = str(exc)
-        driver_logger.warning("Chrome/Chromium не найден: %s", exc)
+        driver_logger.warning("Chrome/Chromium not found: %s", exc)
     except Exception as exc:
-        _driver_error_hint = f"Preflight драйвера завершился ошибкой: {exc}"
-        driver_logger.exception("Ошибка preflight драйвера")
+        _driver_error_hint = f"Driver preflight failed: {exc}"
+        driver_logger.exception("Driver preflight failed")
 
 
 async def _ensure_driver(*, force_refresh: bool = False) -> None:
@@ -441,38 +461,45 @@ async def _ensure_driver(*, force_refresh: bool = False) -> None:
         _driver = await asyncio.to_thread(_create_driver_sync, _driver_resolution)
 
 
-async def capture_telegram_post(url: str, progress_message: types.Message, cid: str) -> tuple[str, bytes] | None:
+async def capture_telegram_post(
+    url: str,
+    progress_message: types.Message,
+    cid: str,
+    locale: str,
+) -> tuple[str, bytes] | None:
     global _driver
-    logger.info("[cid=%s] Запуск обработки поста: %s", cid, url)
-    await progress_message.edit_text("🔄 Запускаю обработку поста...")
+    logger.info("[cid=%s] Starting post processing: %s", cid, url)
+    await progress_message.edit_text(_t(locale, "capture.start"))
 
     try:
         await _ensure_driver(force_refresh=False)
     except BrowserNotFoundError:
         hint = _driver_error_hint or _driver_manager.browser_install_hint()
-        await progress_message.edit_text(f"❌ Chrome/Chromium не найден. {hint}")
+        await progress_message.edit_text(_t(locale, "capture.browser_missing", hint=hint))
         return None
     except Exception as exc:
-        logger.exception("[cid=%s] Ошибка инициализации браузера: %s", cid, exc)
-        await progress_message.edit_text("❌ Ошибка инициализации браузера")
+        logger.exception("[cid=%s] Browser initialization failed: %s", cid, exc)
+        await progress_message.edit_text(_t(locale, "capture.init_error"))
         return None
 
-    await progress_message.edit_text("⏳ Ожидание загрузки...")
+    await progress_message.edit_text(_t(locale, "capture.loading"))
     async with _driver_lock:
         try:
             _trim_chromedriver_log_if_needed()
             post_screenshot = await asyncio.to_thread(_selenium_capture, _driver, url)
         except SessionNotCreatedException:
-            logger.warning("[cid=%s] SessionNotCreated, перезапускаем драйвер", cid)
+            logger.warning("[cid=%s] SessionNotCreated, recreating driver", cid)
             try:
                 await _ensure_driver(force_refresh=True)
                 post_screenshot = await asyncio.to_thread(_selenium_capture, _driver, url)
             except Exception as exc:
-                logger.exception("[cid=%s] Повтор после переустановки драйвера не удался: %s", cid, exc)
-                await progress_message.edit_text(f"❌ Не удалось обновить ChromeDriver: {exc}")
+                logger.exception("[cid=%s] Retry after driver refresh failed: %s", cid, exc)
+                await progress_message.edit_text(
+                    _t(locale, "capture.driver_update_failed", error=str(exc)[:200])
+                )
                 return None
         except Exception as exc:
-            logger.exception("[cid=%s] Ошибка захвата страницы: %s", cid, exc)
+            logger.exception("[cid=%s] Page capture failed: %s", cid, exc)
             stale_driver = _driver
             _driver = None
             if stale_driver is not None:
@@ -481,16 +508,16 @@ async def capture_telegram_post(url: str, progress_message: types.Message, cid: 
                     await asyncio.to_thread(_cleanup_profile_from_driver, stale_driver)
                 except Exception:
                     pass
-            await progress_message.edit_text(f"❌ Ошибка при загрузке страницы: {str(exc)[:200]}")
+            await progress_message.edit_text(_t(locale, "capture.load_error", error=str(exc)[:200]))
             return None
 
-    await progress_message.edit_text("📸 Делаю скриншот поста...")
+    await progress_message.edit_text(_t(locale, "capture.screenshot"))
     loop = asyncio.get_running_loop()
     try:
         img = await loop.run_in_executor(_process_pool, _remove_green_pixels_sync, post_screenshot)
     except Exception as exc:
-        logger.exception("[cid=%s] Ошибка обработки изображения: %s", cid, exc)
-        await progress_message.edit_text(f"❌ Ошибка при обработке изображения: {str(exc)[:200]}")
+        logger.exception("[cid=%s] Image processing failed: %s", cid, exc)
+        await progress_message.edit_text(_t(locale, "capture.image_processing_error", error=str(exc)[:200]))
         return None
 
     cleaned_url = re.sub(r"[^a-zA-Z0-9]", "_", url.split("t.me/")[-1].split("?embed=1")[0]) or "post"
@@ -498,7 +525,7 @@ async def capture_telegram_post(url: str, progress_message: types.Message, cid: 
     img.save(buf, format="PNG")
     buf.seek(0)
 
-    await progress_message.edit_text("✅ Изображение готово!")
+    await progress_message.edit_text(_t(locale, "capture.ready"))
     return cleaned_url + ".png", buf.read()
 
 
@@ -513,63 +540,74 @@ def _is_admin(user_id: int) -> bool:
     return user_id in settings.bot.admin_ids
 
 
-def _admin_menu() -> InlineKeyboardMarkup:
+def _admin_menu(locale: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="📊 Live-сводка", callback_data="admin:live")],
-            [InlineKeyboardButton(text="👤 Последние пользователи", callback_data="admin:users")],
-            [InlineKeyboardButton(text="🕒 Последние действия", callback_data="admin:events")],
-            [InlineKeyboardButton(text="⚠️ Ошибки", callback_data="admin:errors")],
-            [InlineKeyboardButton(text="🔎 Поиск пользователя", callback_data="admin:find_help")],
-            [InlineKeyboardButton(text="🗜 Сжать историю", callback_data="admin:compact")],
-            [InlineKeyboardButton(text="🔄 Обновить", callback_data="admin:refresh")],
+            [InlineKeyboardButton(text=_t(locale, "admin.menu.live"), callback_data="admin:live")],
+            [InlineKeyboardButton(text=_t(locale, "admin.menu.users"), callback_data="admin:users")],
+            [InlineKeyboardButton(text=_t(locale, "admin.menu.events"), callback_data="admin:events")],
+            [InlineKeyboardButton(text=_t(locale, "admin.menu.errors"), callback_data="admin:errors")],
+            [InlineKeyboardButton(text=_t(locale, "admin.menu.find_help"), callback_data="admin:find_help")],
+            [InlineKeyboardButton(text=_t(locale, "admin.menu.compact"), callback_data="admin:compact")],
+            [InlineKeyboardButton(text=_t(locale, "admin.menu.refresh"), callback_data="admin:refresh")],
         ]
     )
 
 
-def _format_live_summary() -> str:
+def _format_live_summary(locale: str) -> str:
     stats = db_stats()
-    warning = db_size_warning()
+    warning_size_mb = db_size_warning_mb()
     lines = [
-        "<b>Live-сводка</b>",
-        f"Пользователей: <b>{stats.get('total_users', 0)}</b>",
-        f"Событий: <b>{stats.get('total_events', 0)}</b>",
-        f"Успешных захватов: <b>{stats.get('capture_success', 0)}</b>",
-        f"Ошибок захвата: <b>{stats.get('capture_failed', 0)}</b>",
-        f"Просмотров админки: <b>{stats.get('admin_views', 0)}</b>",
+        _t(locale, "admin.live.title"),
+        _t(locale, "admin.live.users", total_users=stats.get("total_users", 0)),
+        _t(locale, "admin.live.events", total_events=stats.get("total_events", 0)),
+        _t(locale, "admin.live.capture_success", capture_success=stats.get("capture_success", 0)),
+        _t(locale, "admin.live.capture_failed", capture_failed=stats.get("capture_failed", 0)),
+        _t(locale, "admin.live.admin_views", admin_views=stats.get("admin_views", 0)),
     ]
-    if warning:
-        lines.append(f"\n⚠️ {warning}")
+    if warning_size_mb is not None:
+        lines.append(_t(locale, "admin.live.db_warning", size_mb=warning_size_mb))
     return "\n".join(lines)
 
 
-def _format_users_page() -> tuple[str, InlineKeyboardMarkup]:
+def _format_users_page(locale: str) -> tuple[str, InlineKeyboardMarkup]:
     users = db_recent_users(10)
-    lines = ["<b>Последние пользователи</b>"]
+    lines = [_t(locale, "admin.users.title")]
     keyboard_rows: list[list[InlineKeyboardButton]] = []
 
     if not users:
-        lines.append("Пока нет пользователей.")
+        lines.append(_t(locale, "admin.users.empty"))
     else:
         for key, data in users:
             username = _safe_html(data.get("username", "None"))
             fullname = _safe_html(data.get("fullname", "*"))
             last_seen = _safe_html(data.get("last_seen", "*"))
             key_safe = _safe_html(key)
-            lines.append(f"• <code>{key_safe}</code> @{username} ({fullname})\n  last_seen: {last_seen}")
-            keyboard_rows.append([InlineKeyboardButton(text=f"Открыть {key}", callback_data=f"admin:user:{key}")])
+            lines.append(
+                _t(
+                    locale,
+                    "admin.users.item",
+                    key=key_safe,
+                    username=username,
+                    fullname=fullname,
+                    last_seen=last_seen,
+                )
+            )
+            keyboard_rows.append(
+                [InlineKeyboardButton(text=_t(locale, "admin.users.open", key=key), callback_data=f"admin:user:{key}")]
+            )
 
-    keyboard_rows.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="admin:refresh")])
+    keyboard_rows.append([InlineKeyboardButton(text=_t(locale, "admin.users.back"), callback_data="admin:refresh")])
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
 
 
-def _format_events_page(*, status: str | None = None) -> str:
+def _format_events_page(locale: str, *, status: str | None = None) -> str:
     events = db_recent_events(20, status=status)
-    title = "Ошибки" if status == "error" else "Последние действия"
-    lines = [f"<b>{title}</b>"]
+    title_key = "admin.events.title_errors" if status == "error" else "admin.events.title_recent"
+    lines = [_t(locale, title_key)]
 
     if not events:
-        lines.append("События не найдены.")
+        lines.append(_t(locale, "admin.events.empty"))
         return "\n".join(lines)
 
     for event in events:
@@ -590,6 +628,7 @@ def _format_events_page(*, status: str | None = None) -> str:
 
 @router_main.message(Command("start"))
 async def start(message: types.Message) -> None:
+    locale = _resolve_locale(message.from_user)
     if message.chat.type == "private" and message.from_user:
         user_id = message.from_user.id
         username = message.from_user.username
@@ -610,18 +649,31 @@ async def start(message: types.Message) -> None:
         )
 
     await message.answer(
-        "Отправьте ссылку на пост в Telegram в формате:\n\n"
-        "✅ <code>https://t.me/channel/post</code>\n"
-        "✅ <code>t.me/channel/post</code>",
+        _t(locale, "user.start.prompt"),
         disable_web_page_preview=True,
         parse_mode="HTML",
     )
 
 
+@router_main.message(Command("lang"))
+async def language_menu(message: types.Message) -> None:
+    locale = _resolve_locale(message.from_user)
+    rows = [
+        [InlineKeyboardButton(text=_t(locale, f"lang.option.{lang}"), callback_data=f"lang:set:{lang}")]
+        for lang in supported_locales()
+    ]
+    await message.answer(
+        _t(locale, "lang.command.prompt"),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
 @router_main.message(Command("admin"))
 async def admin_panel(message: types.Message) -> None:
+    locale = _resolve_locale(message.from_user)
     if not message.from_user or not _is_admin(message.from_user.id):
-        await message.answer("⛔ Доступ запрещён.")
+        await message.answer(_t(locale, "common.access_denied"))
         return
 
     db_log_event(
@@ -631,24 +683,25 @@ async def admin_panel(message: types.Message) -> None:
         status="ok",
         meta={},
     )
-    await message.answer(_format_live_summary(), parse_mode="HTML", reply_markup=_admin_menu())
+    await message.answer(_format_live_summary(locale), parse_mode="HTML", reply_markup=_admin_menu(locale))
 
 
 @router_main.message(Command("admin_find"))
 async def admin_find_user(message: types.Message) -> None:
+    locale = _resolve_locale(message.from_user)
     if not message.from_user or not _is_admin(message.from_user.id):
-        await message.answer("⛔ Доступ запрещён.")
+        await message.answer(_t(locale, "common.access_denied"))
         return
 
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2:
-        await message.answer("Использование: /admin_find <user_id|@username>")
+        await message.answer(_t(locale, "admin.find.usage"))
         return
 
     query = parts[1]
     found = db_find_user(query)
     if not found:
-        await message.answer("Пользователь не найден.")
+        await message.answer(_t(locale, "admin.find.not_found"))
         return
 
     key, user = found
@@ -658,21 +711,55 @@ async def admin_find_user(message: types.Message) -> None:
     first_login = _safe_html(user.get("first_login", "*"))
     last_seen = _safe_html(user.get("last_seen", "*"))
     await message.answer(
-        "<b>Пользователь найден</b>\n"
-        f"key: <code>{_safe_html(key)}</code>\n"
-        f"username: @{username}\n"
-        f"fullname: {fullname}\n"
-        f"role: {role}\n"
-        f"first_login: {first_login}\n"
-        f"last_seen: {last_seen}",
+        _t(
+            locale,
+            "admin.find.found",
+            key=_safe_html(key),
+            username=username,
+            fullname=fullname,
+            role=role,
+            first_login=first_login,
+            last_seen=last_seen,
+        ),
         parse_mode="HTML",
     )
 
 
+@router_main.callback_query(F.data.startswith("lang:set:"))
+async def language_callbacks(callback: types.CallbackQuery) -> None:
+    if not callback.from_user:
+        await callback.answer()
+        return
+
+    parts = (callback.data or "").split(":", maxsplit=2)
+    if len(parts) != 3:
+        await callback.answer()
+        return
+
+    selected_locale = normalize_locale(parts[2])
+    current_locale = _resolve_locale(callback.from_user)
+    if selected_locale == current_locale:
+        await callback.answer(_t(current_locale, "lang.already_set"), show_alert=False)
+        return
+
+    db_set_locale(callback.from_user.id, selected_locale)
+    if callback.message is not None:
+        await callback.message.edit_text(
+            _t(
+                selected_locale,
+                "lang.updated",
+                language_name=_t(selected_locale, f"lang.option.{selected_locale}"),
+            ),
+            parse_mode="HTML",
+        )
+    await callback.answer()
+
+
 @router_main.callback_query(F.data.startswith("admin:"))
 async def admin_callbacks(callback: types.CallbackQuery) -> None:
+    locale = _resolve_locale(callback.from_user)
     if not callback.from_user or not _is_admin(callback.from_user.id):
-        await callback.answer("Нет доступа", show_alert=True)
+        await callback.answer(_t(locale, "callback.no_access"), show_alert=True)
         return
     if callback.message is None:
         await callback.answer()
@@ -690,32 +777,36 @@ async def admin_callbacks(callback: types.CallbackQuery) -> None:
     )
 
     if section in {"live", "refresh"}:
-        await callback.message.edit_text(_format_live_summary(), parse_mode="HTML", reply_markup=_admin_menu())
+        await callback.message.edit_text(
+            _format_live_summary(locale),
+            parse_mode="HTML",
+            reply_markup=_admin_menu(locale),
+        )
     elif section == "users":
-        text, markup = _format_users_page()
+        text, markup = _format_users_page(locale)
         await callback.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
     elif section == "events":
         await callback.message.edit_text(
-            _format_events_page(), parse_mode="HTML", reply_markup=_admin_menu()
+            _format_events_page(locale), parse_mode="HTML", reply_markup=_admin_menu(locale)
         )
     elif section == "errors":
         await callback.message.edit_text(
-            _format_events_page(status="error"),
+            _format_events_page(locale, status="error"),
             parse_mode="HTML",
-            reply_markup=_admin_menu(),
+            reply_markup=_admin_menu(locale),
         )
     elif section == "find_help":
         await callback.message.edit_text(
-            "Поиск пользователя:\nИспользуйте команду <code>/admin_find &lt;user_id|@username&gt;</code>",
+            _t(locale, "admin.find.help"),
             parse_mode="HTML",
-            reply_markup=_admin_menu(),
+            reply_markup=_admin_menu(locale),
         )
     elif section == "compact":
         removed = db_compact_events(keep_last=2000)
         await callback.message.edit_text(
-            f"История событий сжата. Удалено записей: <b>{removed}</b>",
+            _t(locale, "admin.compact.done", removed=removed),
             parse_mode="HTML",
-            reply_markup=_admin_menu(),
+            reply_markup=_admin_menu(locale),
         )
     elif section == "user" and len(action) == 3:
         user_key = action[2]
@@ -728,19 +819,24 @@ async def admin_callbacks(callback: types.CallbackQuery) -> None:
             first_login = _safe_html(user.get("first_login", "*"))
             last_seen = _safe_html(user.get("last_seen", "*"))
             await callback.message.edit_text(
-                "<b>Карточка пользователя</b>\n"
-                f"key: <code>{_safe_html(key)}</code>\n"
-                f"username: @{username}\n"
-                f"fullname: {fullname}\n"
-                f"role: {role}\n"
-                f"first_login: {first_login}\n"
-                f"last_seen: {last_seen}",
+                _t(
+                    locale,
+                    "admin.user.card",
+                    key=_safe_html(key),
+                    username=username,
+                    fullname=fullname,
+                    role=role,
+                    first_login=first_login,
+                    last_seen=last_seen,
+                ),
                 parse_mode="HTML",
-                reply_markup=_admin_menu(),
+                reply_markup=_admin_menu(locale),
             )
         else:
             await callback.message.edit_text(
-                "Пользователь не найден.", parse_mode="HTML", reply_markup=_admin_menu()
+                _t(locale, "admin.find.not_found"),
+                parse_mode="HTML",
+                reply_markup=_admin_menu(locale),
             )
 
     await callback.answer()
@@ -755,11 +851,12 @@ async def link_check(message: types.Message) -> None:
     username = message.from_user.username
     fullname = message.from_user.first_name
     db_register(user_id, username, fullname)
+    _resolve_locale(message.from_user)
 
     try:
         await handle_post_link(message)
     except Exception as exc:
-        logger.exception("Ошибка в обработке сообщения: %s", exc)
+        logger.exception("Message handling failed: %s", exc)
         db_log_event(
             user_id=user_id,
             username=username,
@@ -776,6 +873,7 @@ async def handle_post_link(message: types.Message) -> None:
     user_id = message.from_user.id
     username = message.from_user.username
     cid = uuid.uuid4().hex[:8]
+    locale = _resolve_locale(message.from_user)
 
     url = validate_tg_link(message.text or "")
     db_log_event(
@@ -788,10 +886,7 @@ async def handle_post_link(message: types.Message) -> None:
 
     if not url:
         await message.answer(
-            "❌ Некорректный формат ссылки!\n\n"
-            "Пример правильной ссылки:\n"
-            "✅ <code>https://t.me/channel/12345</code>\n"
-            "✅ <code>t.me/channel/12345</code>",
+            _t(locale, "user.link.invalid"),
             disable_web_page_preview=True,
             parse_mode="HTML",
         )
@@ -806,7 +901,7 @@ async def handle_post_link(message: types.Message) -> None:
             status="error",
             meta={"retry_after": round(retry_after, 2)},
         )
-        await message.answer(f"⏳ Слишком часто. Повторите через {retry_after:.1f} сек.")
+        await message.answer(_t(locale, "user.rate_limited", retry_after=retry_after))
         return
 
     queue_slot_acquired = await _acquire_capture_slot()
@@ -821,26 +916,22 @@ async def handle_post_link(message: types.Message) -> None:
                 "queue_wait_seconds": _CAPTURE_QUEUE_WAIT_SECONDS,
             },
         )
-        await message.answer("⚠️ Бот сейчас перегружен. Попробуйте через 5-10 секунд.")
+        await message.answer(_t(locale, "user.queue_overloaded"))
         return
 
     is_first_image = await _consume_first_image_flag()
     try:
         if is_first_image:
-            await message.answer(
-                "⚠️ Внимание: это первое изображение после запуска бота.\n"
-                "Иногда оно может отобразиться некорректно.\n"
-                "Если результат будет неправильным, отправьте ту же ссылку ещё раз — обычно всё работает нормально."
-            )
+            await message.answer(_t(locale, "user.first_image.warning"))
 
-        progress_message = await message.answer("🔄 Обрабатываю пост...")
-        result = await capture_telegram_post(url, progress_message, cid)
+        progress_message = await message.answer(_t(locale, "progress.processing"))
+        result = await capture_telegram_post(url, progress_message, cid, locale)
 
         if result:
             filename, data = result
-            await progress_message.edit_text("📤 Отправляю скриншот...")
+            await progress_message.edit_text(_t(locale, "progress.sending"))
             await message.answer_document(BufferedInputFile(data, filename=filename))
-            await progress_message.edit_text("✅ Скриншот успешно отправлен!")
+            await progress_message.edit_text(_t(locale, "progress.sent"))
             db_log_event(
                 user_id=user_id,
                 username=username,
@@ -849,7 +940,7 @@ async def handle_post_link(message: types.Message) -> None:
                 meta={"url": url},
             )
         else:
-            await progress_message.edit_text("❌ Не удалось обработать пост. Попробуйте еще раз!")
+            await progress_message.edit_text(_t(locale, "progress.failed"))
             db_log_event(
                 user_id=user_id,
                 username=username,

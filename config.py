@@ -17,6 +17,8 @@ class BotSettings:
     bot_token: str
     admin_ids: set[int]
     log_level: str
+    default_locale: str
+    supported_locales: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -56,7 +58,7 @@ def _load_env_file(path: Path) -> None:
         if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
             value = value[1:-1]
 
-        # Явно заданные переменные окружения имеют приоритет над .env.
+        # Explicitly set environment variables have priority over .env.
         os.environ.setdefault(key, value)
 
 
@@ -77,9 +79,24 @@ def _parse_admin_ids(value: str | None) -> set[int]:
         if not part:
             continue
         if not part.lstrip("-").isdigit():
-            raise RuntimeError(f"Некорректный ADMIN_IDS: '{part}' не является числом.")
+            raise RuntimeError(f"Invalid ADMIN_IDS: '{part}' is not a number.")
         parsed.add(int(part))
     return parsed
+
+
+def _parse_supported_locales(value: str | None) -> tuple[str, ...]:
+    if not value:
+        return ("en", "ru")
+
+    parsed: list[str] = []
+    for raw_part in value.split(","):
+        locale = raw_part.strip().lower()
+        if locale and locale not in parsed:
+            parsed.append(locale)
+
+    if "en" not in parsed:
+        parsed.insert(0, "en")
+    return tuple(parsed or ("en", "ru"))
 
 
 def load_settings(*, require_bot_token: bool = True) -> Settings:
@@ -87,10 +104,14 @@ def load_settings(*, require_bot_token: bool = True) -> Settings:
 
     bot_token = os.getenv("BOT_TOKEN", "").strip()
     if require_bot_token and not bot_token:
-        raise RuntimeError("Переменная окружения BOT_TOKEN не задана.")
+        raise RuntimeError("Environment variable BOT_TOKEN is not set.")
 
     log_level = os.getenv("LOG_LEVEL", "INFO").strip().upper() or "INFO"
     admin_ids = _parse_admin_ids(_normalize_optional(os.getenv("ADMIN_IDS")))
+    supported_locales = _parse_supported_locales(_normalize_optional(os.getenv("SUPPORTED_LOCALES")))
+    default_locale = (_normalize_optional(os.getenv("DEFAULT_LOCALE")) or "en").lower()
+    if default_locale not in supported_locales:
+        default_locale = "en" if "en" in supported_locales else supported_locales[0]
 
     db_env = _normalize_optional(os.getenv("DATABASE_PATH"))
     database_path = Path(db_env).expanduser() if db_env else DEFAULT_DB_PATH
@@ -107,6 +128,8 @@ def load_settings(*, require_bot_token: bool = True) -> Settings:
             bot_token=bot_token,
             admin_ids=admin_ids,
             log_level=log_level,
+            default_locale=default_locale,
+            supported_locales=supported_locales,
         ),
         driver=DriverSettings(
             chrome_binary=_normalize_optional(os.getenv("CHROME_BINARY")),

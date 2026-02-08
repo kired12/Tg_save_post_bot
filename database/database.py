@@ -22,6 +22,7 @@ DEFAULT_USER = {
     "role": "member",
     "first_login": "*",
     "last_seen": "*",
+    "locale": None,
 }
 
 
@@ -80,7 +81,7 @@ class Database:
             if isinstance(users, dict):
                 normalized["users"] = self._normalize_user_keys(users)
         else:
-            # миграция legacy-формата: ключи пользователей были в корне
+            # Legacy format migration: user keys were stored at the root.
             legacy_users = {
                 key: value
                 for key, value in loaded.items()
@@ -243,11 +244,10 @@ class Database:
                 return 0
             return self.filename.stat().st_size
 
-    def db_size_warning(self) -> str | None:
+    def db_size_warning_mb(self) -> float | None:
         size = self.file_size_bytes()
         if size > MAX_DB_SIZE_BYTES:
-            size_mb = size / (1024 * 1024)
-            return f"Размер базы {size_mb:.2f} MB превышает рекомендуемый лимит 10 MB."
+            return size / (1024 * 1024)
         return None
 
 
@@ -314,6 +314,24 @@ def db_get_value(user_id: int, field: str) -> Any:
     return user_data.get(field) if user_data else None
 
 
+def db_get_locale(user_id: int) -> str | None:
+    user_data = _db.get_user(_get_key(user_id))
+    if not user_data:
+        return None
+    locale = user_data.get("locale")
+    return str(locale) if isinstance(locale, str) and locale else None
+
+
+def db_set_locale(user_id: int, locale: str) -> None:
+    key = _get_key(user_id)
+
+    def _updater(user_data: dict[str, Any]) -> dict[str, Any]:
+        user_data["locale"] = locale
+        return user_data
+
+    _db.update_user(key, _updater)
+
+
 def db_log_event(
     *,
     user_id: int,
@@ -373,7 +391,14 @@ def db_find_user(query: str) -> tuple[str, dict[str, Any]] | None:
 
 
 def db_size_warning() -> str | None:
-    return _db.db_size_warning()
+    size_mb = _db.db_size_warning_mb()
+    if size_mb is None:
+        return None
+    return f"Database size {size_mb:.2f} MB exceeds the recommended limit of 10 MB."
+
+
+def db_size_warning_mb() -> float | None:
+    return _db.db_size_warning_mb()
 
 
 def db_compact_events(keep_last: int = 2000) -> int:

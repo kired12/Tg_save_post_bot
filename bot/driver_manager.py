@@ -98,7 +98,7 @@ class DriverManager:
             installed_major = self._driver_major_version(destination)
             if installed_major != browser_major:
                 raise DriverInstallError(
-                    f"После установки версия драйвера {installed_major}, ожидалась {browser_major}."
+                    f"Installed driver major version is {installed_major}, expected {browser_major}."
                 )
             return DriverResolution(
                 driver_path=destination,
@@ -108,7 +108,7 @@ class DriverManager:
             )
         except Exception as exc:
             logger.warning(
-                "Автоустановка ChromeDriver не удалась, переключаемся на Selenium Manager: %s",
+                "ChromeDriver auto-install failed, falling back to Selenium Manager: %s",
                 exc,
             )
             return DriverResolution(
@@ -121,12 +121,12 @@ class DriverManager:
     def browser_install_hint(self) -> str:
         system = platform.system().lower()
         if system == "darwin":
-            return "Установите Google Chrome: brew install --cask google-chrome"
+            return "Install Google Chrome: brew install --cask google-chrome"
         if system == "linux":
-            return "Установите Google Chrome/Chromium через пакетный менеджер вашей ОС."
+            return "Install Google Chrome/Chromium using your OS package manager."
         if system == "windows":
-            return "Установите Google Chrome с https://www.google.com/chrome/"
-        return "Установите Google Chrome или Chromium и перезапустите бота."
+            return "Install Google Chrome from https://www.google.com/chrome/"
+        return "Install Google Chrome or Chromium and restart the bot."
 
     def _resolve_browser_binary(self) -> str:
         if self.settings.chrome_binary:
@@ -169,7 +169,7 @@ class DriverManager:
     def _extract_major(version_output: str, name: str) -> int:
         match = re.search(r"(\d+)\.", version_output)
         if not match:
-            raise RuntimeError(f"Не удалось определить major-версию {name}: {version_output}")
+            raise RuntimeError(f"Failed to determine major version for {name}: {version_output}")
         return int(match.group(1))
 
     def _browser_major_version(self, binary: str) -> int:
@@ -180,9 +180,9 @@ class DriverManager:
                 capture_output=True,
                 text=True,
             )
-            return self._extract_major(completed.stdout.strip() or completed.stderr.strip(), "браузера")
+            return self._extract_major(completed.stdout.strip() or completed.stderr.strip(), "browser")
         except (subprocess.SubprocessError, OSError) as exc:
-            raise BrowserNotFoundError(f"Не удалось получить версию браузера: {exc}") from exc
+            raise BrowserNotFoundError(f"Failed to get browser version: {exc}") from exc
 
     def _driver_major_version(self, driver: Path) -> int:
         try:
@@ -192,9 +192,9 @@ class DriverManager:
                 capture_output=True,
                 text=True,
             )
-            return self._extract_major(completed.stdout.strip() or completed.stderr.strip(), "драйвера")
+            return self._extract_major(completed.stdout.strip() or completed.stderr.strip(), "driver")
         except (subprocess.SubprocessError, OSError) as exc:
-            raise DriverInstallError(f"Не удалось получить версию драйвера {driver}: {exc}") from exc
+            raise DriverInstallError(f"Failed to get driver version from {driver}: {exc}") from exc
 
     @staticmethod
     def _current_target() -> PlatformTarget:
@@ -214,7 +214,7 @@ class DriverManager:
             cft_platform = "win64" if arch == "x64" else "win32"
             return PlatformTarget("win", arch, cft_platform, "chromedriver.exe")
 
-        raise DriverInstallError(f"Неподдерживаемая ОС: {system}")
+        raise DriverInstallError(f"Unsupported OS: {system}")
 
     def _download_and_install_for_major(
         self,
@@ -226,19 +226,19 @@ class DriverManager:
         milestones = metadata.get("milestones", {})
         milestone = milestones.get(str(browser_major))
         if not milestone:
-            raise DriverInstallError(f"Для major-версии {browser_major} нет данных в Chrome for Testing.")
+            raise DriverInstallError(f"No Chrome for Testing data for major version {browser_major}.")
 
         downloads = milestone.get("downloads", {}).get("chromedriver", [])
         selected = next((item for item in downloads if item.get("platform") == target.cft_platform), None)
         if not selected:
-            raise DriverInstallError(f"Нет chromedriver для платформы {target.cft_platform}.")
+            raise DriverInstallError(f"No chromedriver available for platform {target.cft_platform}.")
 
         download_url = selected.get("url")
         if not isinstance(download_url, str) or not download_url.startswith("https://storage.googleapis.com/chrome-for-testing-public/"):
-            raise DriverInstallError("Обнаружен небезопасный URL для скачивания драйвера.")
+            raise DriverInstallError("Detected unsafe driver download URL.")
         archive_sha256 = self._extract_sha256(selected)
         if not archive_sha256:
-            raise DriverInstallError("В метаданных отсутствует sha256 для архива chromedriver.")
+            raise DriverInstallError("Metadata does not contain sha256 for chromedriver archive.")
 
         with tempfile.TemporaryDirectory(prefix="tsp-driver-") as tmp_dir_name:
             tmp_dir = Path(tmp_dir_name)
@@ -251,7 +251,7 @@ class DriverManager:
 
             extracted = self._find_extracted_binary(tmp_dir, target.executable_name)
             if not extracted:
-                raise DriverInstallError("После распаковки не найден бинарник chromedriver.")
+                raise DriverInstallError("chromedriver binary not found after archive extraction.")
 
             final_tmp = destination.with_suffix(destination.suffix + ".tmp")
             final_tmp.parent.mkdir(parents=True, exist_ok=True)
@@ -285,7 +285,7 @@ class DriverManager:
                 return
             except (URLError, TimeoutError, OSError) as exc:
                 last_error = exc
-        raise DriverInstallError(f"Не удалось скачать драйвер после {retries} попыток: {last_error}")
+        raise DriverInstallError(f"Failed to download driver after {retries} attempts: {last_error}")
 
     @staticmethod
     def _extract_sha256(download_item: dict[str, Any]) -> str | None:
@@ -308,7 +308,7 @@ class DriverManager:
         expected = expected_sha256.lower()
         if actual_sha256 != expected:
             raise DriverInstallError(
-                "Контрольная сумма архива chromedriver не совпала: "
+                "chromedriver archive checksum mismatch: "
                 f"expected={expected} actual={actual_sha256}"
             )
 
@@ -318,7 +318,7 @@ class DriverManager:
             with urlopen(url, timeout=20) as response:
                 return json.loads(response.read().decode("utf-8"))
         except Exception as exc:
-            raise DriverInstallError(f"Не удалось получить метаданные Chrome for Testing: {exc}") from exc
+            raise DriverInstallError(f"Failed to fetch Chrome for Testing metadata: {exc}") from exc
 
     def _write_metadata(
         self,

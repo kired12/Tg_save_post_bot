@@ -2,6 +2,7 @@ import asyncio
 import logging
 
 from aiogram import Bot, Dispatcher
+from aiogram.types import BotCommand
 
 from bot.main import preflight_driver_startup, router_main
 from config import get_settings
@@ -15,6 +16,12 @@ async def main() -> None:
     )
 
     bot = Bot(token=settings.bot.bot_token)
+    await bot.set_my_commands(
+        commands=[
+            BotCommand(command="start", description="Start bot"),
+            BotCommand(command="lang", description="Change language"),
+        ]
+    )
     dispatcher = Dispatcher()
     dispatcher.include_router(router_main)
 

@@ -9,6 +9,8 @@
 - Fallback на Selenium Manager, если локальная установка драйвера не удалась.
 - Админ-панель `/admin` внутри Telegram.
 - Live-аналитика пользователей и событий.
+- Локализация интерфейса: `English` и `Русский`.
+- Команда `/lang` для переключения языка.
 
 ## Быстрый старт
 
@@ -37,9 +39,24 @@
 - `CHROMEDRIVER_DIR` (default `chromedriver/`)
 - `CHROME_BINARY` (optional override пути к браузеру)
 - `CHROMEDRIVER_PATH` (debug override, не для обычного использования)
+- `DEFAULT_LOCALE` (default `en`, базовый fallback языка)
+- `SUPPORTED_LOCALES` (default `en,ru`, список доступных локалей)
 - `USER_RATE_LIMIT_SECONDS` (default `5`, пауза между запросами одного пользователя)
 - `CAPTURE_QUEUE_LIMIT` (default `5`, лимит одновременных задач в очереди)
 - `CAPTURE_QUEUE_WAIT_SECONDS` (default `2`, сколько ждать места в очереди)
+
+## Локализация (i18n)
+
+- Язык пользователя хранится в базе (`locale` в профиле пользователя).
+- При первом контакте язык определяется из Telegram `language_code`.
+- Если язык не поддерживается, используется `DEFAULT_LOCALE` (по умолчанию `en`).
+- `/lang` отправляет inline-кнопки, где каждая кнопка соответствует отдельному языку.
+
+### Добавление нового языка
+
+1. Добавьте файл локали `bot/locales/<locale>.json` с теми же ключами, что в `en.json`.
+2. Добавьте код языка в `SUPPORTED_LOCALES` (например: `en,ru,de`).
+3. При необходимости измените `DEFAULT_LOCALE`.
 
 ## Как работает автоустановка ChromeDriver
 
