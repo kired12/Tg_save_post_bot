@@ -1,0 +1,26 @@
+{
+  "users": {
+    "tps_1000000001": {
+      "username": "example_user",
+      "fullname": "Example User",
+      "role": "member",
+      "first_login": "*",
+      "last_seen": "2026-02-08T22:00:00+00:00"
+    }
+  },
+  "events": [
+    {
+      "timestamp": "2026-02-08T22:00:00+00:00",
+      "user_id": 1000000001,
+      "username": "example_user",
+      "action": "user_started_bot",
+      "status": "ok",
+      "meta": {}
+    }
+  ],
+  "stats": {
+    "capture_success": 0,
+    "capture_failed": 0,
+    "admin_views": 0
+  }
+}
